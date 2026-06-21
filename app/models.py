@@ -28,6 +28,9 @@ class Unit(Base):
     daily_reports: Mapped[List["DailyReport"]] = relationship(
         back_populates="unit", cascade="all, delete-orphan"
     )
+    trial_reviews: Mapped[List["TrialOperationReview"]] = relationship(
+        back_populates="unit", cascade="all, delete-orphan"
+    )
 
 
 class GridAcceptance(Base):
@@ -83,6 +86,9 @@ class DailyReport(Base):
     curtailment_allocations: Mapped[List["CurtailmentAllocation"]] = relationship(
         back_populates="daily_report", cascade="all, delete-orphan"
     )
+    trial_review: Mapped[Optional["TrialOperationReview"]] = relationship(
+        back_populates="daily_report", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class CurtailmentRecord(Base):
@@ -125,3 +131,35 @@ class CurtailmentAllocation(Base):
     daily_report: Mapped[Optional["DailyReport"]] = relationship(
         back_populates="curtailment_allocations"
     )
+
+
+class TrialOperationReview(Base):
+    """试运行扣减复核：试运行期间电量先入待复核池，核对调度许可、验收结论与日报数据
+    三者一致后转入结算电量；复核不通过则退回日报修正，并记录差异说明。"""
+
+    __tablename__ = "trial_operation_reviews"
+
+    STATUS_PENDING = "pending_review"
+    STATUS_PASSED = "passed"
+    STATUS_REJECTED = "rejected"
+    STATUS_RETURNED = "returned_to_report"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    daily_report_id: Mapped[int] = mapped_column(
+        ForeignKey("daily_reports.id"), unique=True, index=True
+    )
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), index=True)
+    review_date: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(32), default=STATUS_PENDING, index=True)
+    review_kwh: Mapped[float] = mapped_column(Float, default=0.0)
+    settled_kwh: Mapped[float] = mapped_column(Float, default=0.0)
+    difference_kwh: Mapped[float] = mapped_column(Float, default=0.0)
+    difference_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    dispatch_permission_no: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    acceptance_result_snapshot: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    reviewer: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    review_note: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    reviewed_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+
+    daily_report: Mapped["DailyReport"] = relationship(back_populates="trial_review")
+    unit: Mapped["Unit"] = relationship(back_populates="trial_reviews")

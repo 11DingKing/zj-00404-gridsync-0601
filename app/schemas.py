@@ -103,6 +103,48 @@ class DailyReportOut(DailyReportBase, ORMBase):
     unit_id: int
 
 
+# ---------- TrialOperationReview ----------
+class TrialOperationReviewCreate(BaseModel):
+    daily_report_id: int = Field(..., description="待复核的试运行日报ID")
+    reviewer: Optional[str] = None
+    review_note: Optional[str] = None
+
+
+class TrialOperationReviewPass(BaseModel):
+    settled_kwh: Optional[float] = Field(
+        None, ge=0, description="复核后转入结算电量，缺省取日报上网电量"
+    )
+    difference_reason: Optional[str] = Field(None, description="差异说明，存在差异时必填")
+    reviewer: Optional[str] = None
+    review_note: Optional[str] = None
+
+
+class TrialOperationReviewReject(BaseModel):
+    difference_reason: str = Field(..., description="复核不通过/退回日报修正的差异说明")
+    return_to_report: bool = Field(
+        True, description="True=退回日报修正，False=仅标记驳回不入结算"
+    )
+    reviewer: Optional[str] = None
+    review_note: Optional[str] = None
+
+
+class TrialOperationReviewOut(ORMBase):
+    id: int
+    daily_report_id: int
+    unit_id: int
+    review_date: date
+    status: str
+    review_kwh: float
+    settled_kwh: float
+    difference_kwh: float
+    difference_reason: Optional[str] = None
+    dispatch_permission_no: Optional[str] = None
+    acceptance_result_snapshot: Optional[str] = None
+    reviewer: Optional[str] = None
+    review_note: Optional[str] = None
+    reviewed_at: Optional[date] = None
+
+
 # ---------- Curtailment ----------
 class CurtailmentAllocationCreate(BaseModel):
     unit_id: int
@@ -146,6 +188,12 @@ class UnitStatsItem(BaseModel):
     fault_downtime_hours: float
     settlement_kwh: float
     trial_operation_kwh: float
+    pending_review_kwh: float = Field(0.0, description="待复核池电量")
+    reviewed_settled_kwh: float = Field(0.0, description="复核通过转入结算电量")
+    review_difference_kwh: float = Field(0.0, description="复核差异电量")
+    review_difference_notes: List[str] = Field(
+        default_factory=list, description="差异说明汇总"
+    )
     equivalent_utilization_hours: float
 
 
@@ -159,7 +207,10 @@ class StatsGroupItem(BaseModel):
     fault_downtime_hours: float
     settlement_kwh: float
     trial_operation_kwh: float
-    equivalent_utilization_hours: float
+    pending_review_kwh: float = 0.0
+    reviewed_settled_kwh: float = 0.0
+    review_difference_kwh: float = 0.0
+    review_difference_notes: List[str] = Field(default_factory=list)
     units: List[UnitStatsItem]
 
 
@@ -181,6 +232,10 @@ class SettlementRow(BaseModel):
     grid_connected_kwh: float
     settlement_kwh: float
     trial_operation_kwh: float
+    pending_review_kwh: float = Field(0.0, description="待复核池电量")
+    reviewed_settled_kwh: float = Field(0.0, description="复核通过转入结算电量")
+    review_difference_kwh: float = Field(0.0, description="复核差异电量")
+    review_difference_notes: List[str] = Field(default_factory=list)
     excluded_reason: Optional[str] = None
 
 
@@ -190,4 +245,7 @@ class SettlementReport(BaseModel):
     total_settlement_kwh: float
     total_grid_connected_kwh: float
     total_trial_operation_kwh: float
+    total_pending_review_kwh: float = 0.0
+    total_reviewed_settled_kwh: float = 0.0
+    total_review_difference_kwh: float = 0.0
     rows: List[SettlementRow]

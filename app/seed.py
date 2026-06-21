@@ -137,10 +137,52 @@ def _do_seed(db: Session) -> None:
         )
     db.add(cr)
 
+    # ---- 试运行扣减复核 ----
+    TR = models.TrialOperationReview
+    review_specs = [
+        dict(code="WTG-01", d="2026-06-05", status=TR.STATUS_PASSED,
+             settled=28500.0, diff_reason=None, reviewer="李调度",
+             note="调度许可、验收结论、日报数据三者一致，复核通过"),
+        dict(code="WTG-01", d="2026-06-06", status=TR.STATUS_PASSED,
+             settled=30000.0, diff_reason="SCADA抄表核实，原上报31200，核实后30000，核减1200kWh",
+             reviewer="李调度", note="上网电量存在差异，已扣减"),
+        dict(code="WTG-01", d="2026-06-07", status=TR.STATUS_PENDING,
+             settled=0.0, diff_reason=None, reviewer=None, note=None),
+        dict(code="WTG-03", d="2026-06-18", status=TR.STATUS_RETURNED,
+             settled=0.0, diff_reason="验收结论为试运行中尚未通过，退回日报修正",
+             reviewer="李调度", note="待验收通过后重新发起复核"),
+    ]
+    review_count = 0
+    for spec in review_specs:
+        rep = report_index[(spec["code"], date.fromisoformat(spec["d"]))]
+        uid = units[spec["code"]].id
+        acc = db.query(models.GridAcceptance).filter_by(unit_id=uid).first()
+        review_kwh = rep.grid_connected_kwh
+        settled = spec["settled"]
+        diff = round(review_kwh - settled, 2)
+        rv = models.TrialOperationReview(
+            daily_report_id=rep.id,
+            unit_id=uid,
+            review_date=rep.report_date,
+            status=spec["status"],
+            review_kwh=review_kwh,
+            settled_kwh=settled,
+            difference_kwh=diff,
+            difference_reason=spec["diff_reason"],
+            dispatch_permission_no=acc.dispatch_permission_no if acc else None,
+            acceptance_result_snapshot=acc.acceptance_result if acc else None,
+            reviewer=spec["reviewer"],
+            review_note=spec["note"],
+            reviewed_at=date(2026, 6, 20) if spec["status"] != TR.STATUS_PENDING else None,
+        )
+        db.add(rv)
+        review_count += 1
+
     db.commit()
     print(
         "已写入初始数据：4 台机组 / 4 条验收记录 / "
-        f"{sum(len(v) for v in reports_data.values())} 条日报 / 1 条限发(3 条分摊)"
+        f"{sum(len(v) for v in reports_data.values())} 条日报 / 1 条限发(3 条分摊) / "
+        f"{review_count} 条试运行复核"
     )
 
 

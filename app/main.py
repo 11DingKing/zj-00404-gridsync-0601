@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.routers import acceptance, curtailment, reports, statistics, units
+from app.routers import acceptance, curtailment, reports, review, statistics, units
 from app.seed import seed_if_empty
 
 
@@ -23,6 +23,7 @@ app.include_router(units.router)
 app.include_router(acceptance.router)
 app.include_router(reports.router)
 app.include_router(curtailment.router)
+app.include_router(review.router)
 app.include_router(statistics.router)
 
 
@@ -36,6 +37,8 @@ def root():
             "/acceptance",
             "/reports",
             "/curtailments",
+            "/reviews",
+            "/reviews/pending",
             "/statistics",
             "/statistics/settlement",
         ],

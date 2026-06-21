@@ -170,3 +170,68 @@ def create_curtailment(
 def delete_curtailment(db: Session, obj: models.CurtailmentRecord) -> None:
     db.delete(obj)
     db.commit()
+
+
+# ---------------- TrialOperationReview ----------------
+def list_reviews(
+    db: Session,
+    status: Optional[str] = None,
+    unit_id: Optional[int] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> List[models.TrialOperationReview]:
+    q = db.query(models.TrialOperationReview)
+    if status:
+        q = q.filter(models.TrialOperationReview.status == status)
+    if unit_id:
+        q = q.filter(models.TrialOperationReview.unit_id == unit_id)
+    if start_date:
+        q = q.filter(models.TrialOperationReview.review_date >= start_date)
+    if end_date:
+        q = q.filter(models.TrialOperationReview.review_date <= end_date)
+    return q.order_by(models.TrialOperationReview.review_date.desc()).all()
+
+
+def get_review(db: Session, review_id: int) -> Optional[models.TrialOperationReview]:
+    return db.get(models.TrialOperationReview, review_id)
+
+
+def get_review_by_report(
+    db: Session, daily_report_id: int
+) -> Optional[models.TrialOperationReview]:
+    return (
+        db.query(models.TrialOperationReview)
+        .filter(models.TrialOperationReview.daily_report_id == daily_report_id)
+        .first()
+    )
+
+
+def create_review(
+    db: Session,
+    report: models.DailyReport,
+    reviewer: Optional[str] = None,
+    review_note: Optional[str] = None,
+) -> models.TrialOperationReview:
+    obj = models.TrialOperationReview(
+        daily_report_id=report.id,
+        unit_id=report.unit_id,
+        review_date=report.report_date,
+        status=models.TrialOperationReview.STATUS_PENDING,
+        review_kwh=report.grid_connected_kwh,
+        settled_kwh=0.0,
+        difference_kwh=0.0,
+        reviewer=reviewer,
+        review_note=review_note,
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def save_review(
+    db: Session, obj: models.TrialOperationReview
+) -> models.TrialOperationReview:
+    db.commit()
+    db.refresh(obj)
+    return obj
