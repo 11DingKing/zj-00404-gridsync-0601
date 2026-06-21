@@ -38,6 +38,10 @@ def _do_seed(db: Session) -> None:
              commissioning_date=date(2026, 6, 12), location="B区"),
         dict(code="WTG-04", name="4号风机", batch=BATCH, rated_capacity_kw=CAP_KW,
              commissioning_date=None, location="B区"),
+        dict(code="WTG-05", name="5号风机", batch="后续批次", rated_capacity_kw=CAP_KW,
+             commissioning_date=date(2026, 6, 10), location="A区"),
+        dict(code="WTG-06", name="6号风机", batch="后续批次", rated_capacity_kw=CAP_KW,
+             commissioning_date=None, location="B区"),
     ]
     units: dict[str, models.Unit] = {}
     for u in units_data:
@@ -80,6 +84,22 @@ def _do_seed(db: Session) -> None:
              trial_operation_end_date=None,
              acceptance_result=GA.RESULT_PENDING, acceptance_date=None,
              remark="已提交并网申请，待调度许可"),
+        dict(unit_id=units["WTG-05"].id,
+             application_status=GA.APP_APPROVED, application_date=date(2026, 6, 12),
+             dispatch_permission_no="调度许字[2026]004号", dispatch_permission_date=date(2026, 6, 14),
+             protection_setting_verified=True, protection_setting_verified_date=date(2026, 6, 15),
+             trial_operation_hours=72.0, trial_operation_start_date=date(2026, 6, 16),
+             trial_operation_end_date=date(2026, 6, 18),
+             acceptance_result=GA.RESULT_PASSED, acceptance_date=date(2026, 6, 19),
+             remark="后续批次首台，验收通过"),
+        dict(unit_id=units["WTG-06"].id,
+             application_status=GA.APP_APPROVED, application_date=date(2026, 6, 15),
+             dispatch_permission_no="调度许字[2026]005号", dispatch_permission_date=date(2026, 6, 17),
+             protection_setting_verified=True, protection_setting_verified_date=date(2026, 6, 18),
+             trial_operation_hours=48.0, trial_operation_start_date=date(2026, 6, 19),
+             trial_operation_end_date=None,
+             acceptance_result=GA.RESULT_TRIAL_OPERATION, acceptance_date=None,
+             remark="后续批次，试运行中，尚未验收"),
     ]
     for a in acc_data:
         db.add(models.GridAcceptance(**a))
@@ -107,6 +127,17 @@ def _do_seed(db: Session) -> None:
             _report("2026-06-18", 24300, 0, 0.0, True),
             _report("2026-06-19", 25600, 1500, 0.0, True),
             _report("2026-06-20", 23900, 0, 0.5, True),
+        ],
+        "WTG-05": [
+            _report("2026-06-16", 22000, 0, 0.0, True),
+            _report("2026-06-17", 24500, 0, 1.0, True),
+            _report("2026-06-18", 23800, 0, 0.0, True),
+            _report("2026-06-19", 26100, 0, 0.0, False),
+            _report("2026-06-20", 25400, 2000, 0.0, False),
+        ],
+        "WTG-06": [
+            _report("2026-06-19", 18000, 0, 0.0, True),
+            _report("2026-06-20", 17200, 0, 2.0, True),
         ],
     }
     report_index: dict[tuple[str, date], models.DailyReport] = {}
@@ -137,6 +168,24 @@ def _do_seed(db: Session) -> None:
         )
     db.add(cr)
 
+    # ---- 限发记录(6-20,送出线路) + 分摊(后续批次参与) ----
+    curtail_date_2 = date(2026, 6, 20)
+    cr2 = models.CurtailmentRecord(
+        record_date=curtail_date_2,
+        reason_type=models.CurtailmentRecord.REASON_TRANSMISSION_LINE,
+        reason_detail="送出线路N-1校核受限，按调度指令对在运机组限发",
+        total_curtailed_kwh=2000.0,
+    )
+    rep5_0620 = report_index[("WTG-05", curtail_date_2)]
+    cr2.allocations.append(
+        models.CurtailmentAllocation(
+            unit_id=units["WTG-05"].id,
+            daily_report_id=rep5_0620.id,
+            allocated_curtailed_kwh=2000.0,
+        )
+    )
+    db.add(cr2)
+
     # ---- 试运行扣减复核 ----
     TR = models.TrialOperationReview
     review_specs = [
@@ -151,6 +200,15 @@ def _do_seed(db: Session) -> None:
         dict(code="WTG-03", d="2026-06-18", status=TR.STATUS_RETURNED,
              settled=0.0, diff_reason="验收结论为试运行中尚未通过，退回日报修正",
              reviewer="李调度", note="待验收通过后重新发起复核"),
+        dict(code="WTG-05", d="2026-06-16", status=TR.STATUS_PASSED,
+             settled=22000.0, diff_reason=None, reviewer="李调度",
+             note="调度许可、验收结论、日报数据三者一致，复核通过"),
+        dict(code="WTG-05", d="2026-06-17", status=TR.STATUS_PASSED,
+             settled=24000.0, diff_reason="SCADA抄表核实，原上报24500，核实后24000，核减500kWh",
+             reviewer="李调度", note="上网电量存在差异，已扣减"),
+        dict(code="WTG-05", d="2026-06-18", status=TR.STATUS_PASSED,
+             settled=23800.0, diff_reason=None, reviewer="李调度",
+             note="三者一致，复核通过"),
     ]
     review_count = 0
     for spec in review_specs:
@@ -179,9 +237,12 @@ def _do_seed(db: Session) -> None:
         review_count += 1
 
     db.commit()
+    unit_total = len(units_data)
+    acc_total = len(acc_data)
+    report_total = sum(len(v) for v in reports_data.values())
     print(
-        "已写入初始数据：4 台机组 / 4 条验收记录 / "
-        f"{sum(len(v) for v in reports_data.values())} 条日报 / 1 条限发(3 条分摊) / "
+        f"已写入初始数据：{unit_total} 台机组（首批 4 + 后续批次 2）/ "
+        f"{acc_total} 条验收记录 / {report_total} 条日报 / 2 条限发(4 条分摊) / "
         f"{review_count} 条试运行复核"
     )
 

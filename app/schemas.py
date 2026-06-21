@@ -258,3 +258,108 @@ class SettlementReport(BaseModel):
     total_reviewed_settled_kwh: float = 0.0
     total_review_difference_kwh: float = 0.0
     rows: List[SettlementRow]
+
+
+# ---------- Reconciliation (并网批次对账单) ----------
+class DailyReportRef(BaseModel):
+    """日报来源引用：对账单中可追溯到具体日报。"""
+
+    report_id: int
+    report_date: date
+    generation_kwh: float
+    grid_connected_kwh: float
+    curtailed_kwh: float
+    is_trial_operation: bool
+    remark: Optional[str] = None
+
+
+class CurtailmentAllocationRef(BaseModel):
+    """限发分摊依据引用：可追溯到限发记录与分摊明细。"""
+
+    allocation_id: int
+    curtailment_record_id: int
+    record_date: date
+    reason_type: str
+    reason_detail: Optional[str] = None
+    allocated_curtailed_kwh: float
+    daily_report_id: Optional[int] = None
+
+
+class TrialReviewRef(BaseModel):
+    """试运行复核引用：可追溯到复核记录及其核减结论。"""
+
+    review_id: int
+    daily_report_id: int
+    review_date: date
+    status: str
+    review_kwh: float
+    settled_kwh: float
+    difference_kwh: float
+    difference_reason: Optional[str] = None
+    reviewer: Optional[str] = None
+
+
+class DeductionItem(BaseModel):
+    """扣减项明细：试运行待复核、复核核减、未通过验收等。"""
+
+    type: str = Field(..., description="unaccepted/pending_review/review_difference")
+    label: str
+    kwh: float = Field(0.0, ge=0)
+    reason: Optional[str] = None
+    daily_report_id: Optional[int] = None
+    review_id: Optional[int] = None
+
+
+class UnitReconciliationItem(BaseModel):
+    """机组对账详情：验收状态、试运行小时、上网电量、限发原因、扣减项、最终可结算电量，
+    并附带日报来源、限发分摊依据、试运行复核引用以支持追溯与跳转。"""
+
+    unit_id: int
+    unit_code: str
+    unit_name: str
+    batch: str
+    rated_capacity_kw: float
+    acceptance_status: str = Field(..., description="并网验收申请/许可状态摘要")
+    acceptance_result: str
+    dispatch_permission_no: Optional[str] = None
+    trial_operation_hours: float = Field(0.0, description="验收记录中的试运行小时数")
+    grid_connected_kwh: float = Field(..., description="上网电量（已扣除限发）")
+    curtailed_kwh: float = Field(0.0, description="日报口径限电量")
+    allocated_curtailed_kwh: float = Field(0.0, description="限发分摊口径限电量（权威）")
+    deduction_kwh: float = Field(0.0, description="扣减项合计")
+    deduction_items: List[DeductionItem] = Field(default_factory=list)
+    settlement_kwh: float = Field(..., description="最终可结算电量")
+    daily_report_refs: List[DailyReportRef] = Field(default_factory=list)
+    curtailment_allocation_refs: List[CurtailmentAllocationRef] = Field(
+        default_factory=list
+    )
+    trial_review_refs: List[TrialReviewRef] = Field(default_factory=list)
+
+
+class BatchReconciliationItem(BaseModel):
+    """批次对账统计：按首批/后续批次汇总，下钻可到机组详情。"""
+
+    batch: str
+    unit_count: int
+    rated_capacity_kw: float
+    trial_operation_hours: float = Field(0.0, description="批次内机组试运行小时合计")
+    grid_connected_kwh: float = 0.0
+    curtailed_kwh: float = 0.0
+    allocated_curtailed_kwh: float = 0.0
+    deduction_kwh: float = 0.0
+    settlement_kwh: float = 0.0
+    curtailment_reasons: List[str] = Field(
+        default_factory=list, description="批次内限发原因汇总（去重）"
+    )
+    units: List[UnitReconciliationItem] = Field(default_factory=list)
+
+
+class ReconciliationReport(BaseModel):
+    """并网批次对账单：批次统计 + 结算汇总，三层互相可跳转。"""
+
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    totals: BatchReconciliationItem = Field(..., description="结算汇总（全部批次）")
+    batches: List[BatchReconciliationItem] = Field(
+        default_factory=list, description="批次统计"
+    )

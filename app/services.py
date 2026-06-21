@@ -643,3 +643,322 @@ def reopen_review(
     review.difference_reason = None
     review.reviewed_at = None
     return crud.save_review(db, review)
+
+
+# ---------------- 并网批次对账单 ----------------
+CURTAILMENT_REASON_LABELS = {
+    models.CurtailmentRecord.REASON_BOOSTER_STATION: "升压站容量受限",
+    models.CurtailmentRecord.REASON_TRANSMISSION_LINE: "送出线路容量受限",
+    models.CurtailmentRecord.REASON_GRID_DISPATCH: "电网调度指令",
+    models.CurtailmentRecord.REASON_EQUIPMENT_FAULT: "设备故障",
+}
+
+_REVIEW_STATUS_LABELS = {
+    models.TrialOperationReview.STATUS_PENDING: "待复核",
+    models.TrialOperationReview.STATUS_PASSED: "复核通过",
+    models.TrialOperationReview.STATUS_REJECTED: "已驳回",
+    models.TrialOperationReview.STATUS_RETURNED: "退回日报修正",
+}
+
+_APP_STATUS_LABELS = {
+    models.GridAcceptance.APP_NOT_SUBMITTED: "未提交申请",
+    models.GridAcceptance.APP_SUBMITTED: "已提交申请",
+    models.GridAcceptance.APP_APPROVED: "申请已批准",
+}
+
+_ACCEPTANCE_RESULT_LABELS = {
+    models.GridAcceptance.RESULT_PENDING: "待验收",
+    models.GridAcceptance.RESULT_TRIAL_OPERATION: "试运行中",
+    models.GridAcceptance.RESULT_PASSED: "验收通过",
+    models.GridAcceptance.RESULT_FAILED: "验收未通过",
+}
+
+
+def curtailment_reason_label(reason_type: str) -> str:
+    return CURTAILMENT_REASON_LABELS.get(reason_type, reason_type)
+
+
+def _acceptance_status_summary(acc: Optional[models.GridAcceptance]) -> str:
+    if acc is None:
+        return "无验收记录"
+    parts = [_APP_STATUS_LABELS.get(acc.application_status, acc.application_status)]
+    if acc.protection_setting_verified:
+        parts.append("保护定值已核对")
+    if acc.dispatch_permission_no:
+        parts.append(f"调度许可 {acc.dispatch_permission_no}")
+    if acc.acceptance_result == models.GridAcceptance.RESULT_PASSED and acc.acceptance_date:
+        parts.append(f"验收日期 {acc.acceptance_date.isoformat()}")
+    return "；".join(parts)
+
+
+def _load_reconciliation_reports(
+    db: Session,
+    start_date: Optional[date],
+    end_date: Optional[date],
+    batch: Optional[str],
+    unit_id: Optional[int] = None,
+) -> List[models.DailyReport]:
+    q = db.query(models.DailyReport).options(
+        selectinload(models.DailyReport.trial_review),
+        selectinload(models.DailyReport.curtailment_allocations).selectinload(
+            models.CurtailmentAllocation.curtailment_record
+        ),
+    )
+    if start_date:
+        q = q.filter(models.DailyReport.report_date >= start_date)
+    if end_date:
+        q = q.filter(models.DailyReport.report_date <= end_date)
+    if unit_id:
+        q = q.filter(models.DailyReport.unit_id == unit_id)
+    if batch:
+        q = q.join(models.Unit).filter(models.Unit.batch == batch)
+    return q.order_by(models.DailyReport.report_date, models.DailyReport.unit_id).all()
+
+
+def build_unit_reconciliation(
+    db: Session,
+    unit: models.Unit,
+    reports: List[models.DailyReport],
+) -> schemas.UnitReconciliationItem:
+    cap = unit.rated_capacity_kw or 0.0
+    acc = unit.acceptance
+    settled = _unit_settled(unit)
+
+    acceptance_result = acc.acceptance_result if acc else models.GridAcceptance.RESULT_PENDING
+    trial_hours = (acc.trial_operation_hours or 0.0) if acc else 0.0
+    dispatch_no = acc.dispatch_permission_no if acc else None
+
+    grid_total = 0.0
+    curtailed_total = 0.0
+    allocated_total = 0.0
+    settlement_total = 0.0
+    deduction_items: List[schemas.DeductionItem] = []
+    daily_refs: List[schemas.DailyReportRef] = []
+    alloc_refs: List[schemas.CurtailmentAllocationRef] = []
+    review_refs: List[schemas.TrialReviewRef] = []
+
+    for report in reports:
+        _, normalized_grid = normalize_daily_report_fields(report, cap)
+        grid_total += normalized_grid
+        curtailed_total += report.curtailed_kwh
+
+        daily_refs.append(
+            schemas.DailyReportRef(
+                report_id=report.id,
+                report_date=report.report_date,
+                generation_kwh=round(report.generation_kwh, 2),
+                grid_connected_kwh=round(normalized_grid, 2),
+                curtailed_kwh=round(report.curtailed_kwh, 2),
+                is_trial_operation=report.is_trial_operation,
+                remark=report.remark,
+            )
+        )
+
+        allocs = report.curtailment_allocations or []
+        for a in allocs:
+            cr = a.curtailment_record
+            allocated_total += a.allocated_curtailed_kwh
+            alloc_refs.append(
+                schemas.CurtailmentAllocationRef(
+                    allocation_id=a.id,
+                    curtailment_record_id=a.curtailment_record_id,
+                    record_date=cr.record_date if cr else report.report_date,
+                    reason_type=cr.reason_type if cr else "",
+                    reason_detail=cr.reason_detail if cr else None,
+                    allocated_curtailed_kwh=round(a.allocated_curtailed_kwh, 2),
+                    daily_report_id=a.daily_report_id,
+                )
+            )
+
+        review = getattr(report, "trial_review", None)
+        if report.is_trial_operation:
+            if review is not None:
+                review_refs.append(
+                    schemas.TrialReviewRef(
+                        review_id=review.id,
+                        daily_report_id=review.daily_report_id,
+                        review_date=review.review_date,
+                        status=review.status,
+                        review_kwh=round(review.review_kwh, 2),
+                        settled_kwh=round(review.settled_kwh, 2),
+                        difference_kwh=round(review.difference_kwh, 2),
+                        difference_reason=review.difference_reason,
+                        reviewer=review.reviewer,
+                    )
+                )
+            if not settled:
+                continue
+            if review is not None and review.status == models.TrialOperationReview.STATUS_PASSED:
+                settlement_total += review.settled_kwh
+                diff = round(review.review_kwh - review.settled_kwh, 2)
+                if diff > 0:
+                    deduction_items.append(
+                        schemas.DeductionItem(
+                            type="review_difference",
+                            label="复核核减电量",
+                            kwh=diff,
+                            reason=review.difference_reason,
+                            daily_report_id=report.id,
+                            review_id=review.id,
+                        )
+                    )
+            else:
+                status_label = _REVIEW_STATUS_LABELS.get(
+                    review.status if review else None, "未发起复核"
+                )
+                deduction_items.append(
+                    schemas.DeductionItem(
+                        type="pending_review",
+                        label="试运行待复核电量未转入结算",
+                        kwh=round(normalized_grid, 2),
+                        reason=f"复核状态：{status_label}",
+                        daily_report_id=report.id,
+                        review_id=review.id if review else None,
+                    )
+                )
+        elif settled:
+            settlement_total += normalized_grid
+
+    if not settled:
+        if grid_total > 0:
+            deduction_items.insert(
+                0,
+                schemas.DeductionItem(
+                    type="unaccepted",
+                    label="未通过并网验收，电量暂不计入结算",
+                    kwh=round(grid_total, 2),
+                    reason=f"验收结论：{_ACCEPTANCE_RESULT_LABELS.get(acceptance_result, acceptance_result)}",
+                ),
+            )
+        settlement_total = 0.0
+
+    curtailed_authoritative = max(curtailed_total, allocated_total)
+
+    return schemas.UnitReconciliationItem(
+        unit_id=unit.id,
+        unit_code=unit.code,
+        unit_name=unit.name,
+        batch=unit.batch,
+        rated_capacity_kw=round(cap, 2),
+        acceptance_status=_acceptance_status_summary(acc),
+        acceptance_result=acceptance_result,
+        dispatch_permission_no=dispatch_no,
+        trial_operation_hours=round(trial_hours, 2),
+        grid_connected_kwh=round(grid_total, 2),
+        curtailed_kwh=round(curtailed_authoritative, 2),
+        allocated_curtailed_kwh=round(allocated_total, 2),
+        deduction_kwh=round(sum(d.kwh for d in deduction_items), 2),
+        deduction_items=deduction_items,
+        settlement_kwh=round(settlement_total, 2),
+        daily_report_refs=daily_refs,
+        curtailment_allocation_refs=alloc_refs,
+        trial_review_refs=review_refs,
+    )
+
+
+def _summarize_batch(
+    batch: str,
+    unit_items: List[schemas.UnitReconciliationItem],
+) -> schemas.BatchReconciliationItem:
+    reasons: set[str] = set()
+    for u in unit_items:
+        for ref in u.curtailment_allocation_refs:
+            label = curtailment_reason_label(ref.reason_type)
+            reasons.add(label if not ref.reason_detail else f"{label}（{ref.reason_detail}）")
+
+    return schemas.BatchReconciliationItem(
+        batch=batch,
+        unit_count=len(unit_items),
+        rated_capacity_kw=round(sum(u.rated_capacity_kw for u in unit_items), 2),
+        trial_operation_hours=round(sum(u.trial_operation_hours for u in unit_items), 2),
+        grid_connected_kwh=round(sum(u.grid_connected_kwh for u in unit_items), 2),
+        curtailed_kwh=round(sum(u.curtailed_kwh for u in unit_items), 2),
+        allocated_curtailed_kwh=round(sum(u.allocated_curtailed_kwh for u in unit_items), 2),
+        deduction_kwh=round(sum(u.deduction_kwh for u in unit_items), 2),
+        settlement_kwh=round(sum(u.settlement_kwh for u in unit_items), 2),
+        curtailment_reasons=sorted(reasons),
+        units=sorted(unit_items, key=lambda u: u.unit_code),
+    )
+
+
+def _load_units_for_reconciliation(
+    db: Session, batch: Optional[str] = None
+) -> List[models.Unit]:
+    q = db.query(models.Unit).options(selectinload(models.Unit.acceptance))
+    if batch:
+        q = q.filter(models.Unit.batch == batch)
+    return q.order_by(models.Unit.code).all()
+
+
+def build_reconciliation_report(
+    db: Session,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    batch: Optional[str] = None,
+) -> schemas.ReconciliationReport:
+    units = _load_units_for_reconciliation(db, batch)
+    reports = _load_reconciliation_reports(db, start_date, end_date, batch)
+
+    reports_by_unit: Dict[int, List[models.DailyReport]] = {}
+    for r in reports:
+        reports_by_unit.setdefault(r.unit_id, []).append(r)
+
+    units_by_batch: Dict[str, List[models.Unit]] = {}
+    for u in units:
+        units_by_batch.setdefault(u.batch, []).append(u)
+
+    batch_items: List[schemas.BatchReconciliationItem] = []
+    for b, batch_units in units_by_batch.items():
+        unit_items = [
+            build_unit_reconciliation(db, u, reports_by_unit.get(u.id, []))
+            for u in batch_units
+        ]
+        batch_items.append(_summarize_batch(b, unit_items))
+    batch_items.sort(key=lambda x: x.batch)
+
+    all_unit_items = [
+        build_unit_reconciliation(db, u, reports_by_unit.get(u.id, [])) for u in units
+    ]
+    totals = _summarize_batch("全部批次", all_unit_items)
+
+    return schemas.ReconciliationReport(
+        start_date=start_date,
+        end_date=end_date,
+        totals=totals,
+        batches=batch_items,
+    )
+
+
+def build_batch_reconciliation_report(
+    db: Session,
+    batch: str,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> schemas.BatchReconciliationItem:
+    units = _load_units_for_reconciliation(db, batch)
+    reports = _load_reconciliation_reports(db, start_date, end_date, batch)
+    reports_by_unit: Dict[int, List[models.DailyReport]] = {}
+    for r in reports:
+        reports_by_unit.setdefault(r.unit_id, []).append(r)
+    unit_items = [
+        build_unit_reconciliation(db, u, reports_by_unit.get(u.id, [])) for u in units
+    ]
+    return _summarize_batch(batch, unit_items)
+
+
+def build_unit_reconciliation_report(
+    db: Session,
+    unit_id: int,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> schemas.UnitReconciliationItem:
+    unit = (
+        db.query(models.Unit)
+        .options(selectinload(models.Unit.acceptance))
+        .filter(models.Unit.id == unit_id)
+        .first()
+    )
+    if unit is None:
+        raise ValueError("机组不存在")
+    reports = _load_reconciliation_reports(db, start_date, end_date, None, unit_id)
+    return build_unit_reconciliation(db, unit, reports)
