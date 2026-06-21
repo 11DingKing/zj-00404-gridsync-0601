@@ -185,7 +185,11 @@ class UnitStatsItem(BaseModel):
     generation_kwh: float
     grid_connected_kwh: float
     curtailed_kwh: float
+    allocated_curtailed_kwh: float = Field(
+        0.0, description="限发分摊记录汇总的权威限电量（优先使用）"
+    )
     fault_downtime_hours: float
+    available_hours: float = Field(0.0, description="可用小时 = 24 − 故障停机小时")
     settlement_kwh: float
     trial_operation_kwh: float
     pending_review_kwh: float = Field(0.0, description="待复核池电量")
@@ -195,6 +199,7 @@ class UnitStatsItem(BaseModel):
         default_factory=list, description="差异说明汇总"
     )
     equivalent_utilization_hours: float
+    availability_rate: float = Field(0.0, description="可用小时占比 = 可用小时 / 统计周期总小时")
 
 
 class StatsGroupItem(BaseModel):
@@ -204,13 +209,17 @@ class StatsGroupItem(BaseModel):
     generation_kwh: float
     grid_connected_kwh: float
     curtailed_kwh: float
+    allocated_curtailed_kwh: float = 0.0
     fault_downtime_hours: float
+    available_hours: float = 0.0
     settlement_kwh: float
     trial_operation_kwh: float
     pending_review_kwh: float = 0.0
     reviewed_settled_kwh: float = 0.0
     review_difference_kwh: float = 0.0
     review_difference_notes: List[str] = Field(default_factory=list)
+    equivalent_utilization_hours: float = 0.0
+    availability_rate: float = 0.0
     units: List[UnitStatsItem]
 
 

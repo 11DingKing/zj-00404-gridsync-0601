@@ -1,13 +1,240 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app import crud, models, schemas
 
 DIMENSIONS = {"daily", "monthly", "batch"}
+HOURS_PER_DAY = 24.0
+
+
+# ---------------- 日报数据校验与规范化 ----------------
+def normalize_daily_report_fields(
+    report: models.DailyReport | schemas.DailyReportCreate | schemas.DailyReportUpdate,
+    unit_capacity_kw: float,
+) -> Tuple[float, float]:
+    """
+    规范化日报关键字段，保证口径一致：
+      1. available_hours = 24 - fault_downtime_hours（限电不影响可用性）
+      2. grid_connected_kwh = generation_kwh - curtailed_kwh
+    返回 (normalized_available_hours, normalized_grid_connected_kwh)
+    """
+    fault = getattr(report, "fault_downtime_hours", 0.0) or 0.0
+    gen = getattr(report, "generation_kwh", 0.0) or 0.0
+    curt = getattr(report, "curtailed_kwh", 0.0) or 0.0
+
+    fault = max(0.0, min(fault, HOURS_PER_DAY))
+    available = round(HOURS_PER_DAY - fault, 4)
+    grid = round(max(0.0, gen - curt), 2)
+    return available, grid
+
+
+def validate_daily_report_capacity(
+    report: models.DailyReport | schemas.DailyReportCreate,
+    unit_capacity_kw: float,
+) -> List[str]:
+    """
+    校验日报数据合理性：
+      - 发电量不得超过「额定容量 × 可用小时」的理论上限
+      - 限电量不得超过「额定容量 × 可用小时 − 实际发电量」的剩余空间
+    """
+    errors: List[str] = []
+    if unit_capacity_kw <= 0:
+        return errors
+
+    available, _ = normalize_daily_report_fields(report, unit_capacity_kw)
+    gen = getattr(report, "generation_kwh", 0.0) or 0.0
+    curt = getattr(report, "curtailed_kwh", 0.0) or 0.0
+
+    theoretical_max = round(unit_capacity_kw * available, 2)
+    if gen > theoretical_max + 0.01:
+        errors.append(
+            f"发电量 {gen} kWh 超过理论上限 {theoretical_max} kWh"
+            f"（{unit_capacity_kw} kW × {available} 小时）"
+        )
+
+    remaining_capacity = max(0.0, theoretical_max - gen)
+    if curt > remaining_capacity + 0.01:
+        errors.append(
+            f"限电量 {curt} kWh 超过剩余可用容量 {remaining_capacity} kWh"
+            f"（理论上限 {theoretical_max} − 实际发电 {gen}）"
+        )
+
+    return errors
+
+
+# ---------------- 限发分摊校验与计算 ----------------
+def get_curtailment_allocations_for_report(
+    db: Session, report: models.DailyReport
+) -> List[models.CurtailmentAllocation]:
+    """获取某日报关联的所有限发分摊记录。"""
+    return (
+        db.query(models.CurtailmentAllocation)
+        .filter(models.CurtailmentAllocation.daily_report_id == report.id)
+        .all()
+    )
+
+
+def get_curtailment_allocations_for_date(
+    db: Session, unit_id: int, record_date: date
+) -> List[models.CurtailmentAllocation]:
+    """获取某机组某天所有限发分摊记录（通过日报关联）。"""
+    return (
+        db.query(models.CurtailmentAllocation)
+        .join(models.DailyReport)
+        .filter(
+            models.CurtailmentAllocation.unit_id == unit_id,
+            models.DailyReport.report_date == record_date,
+        )
+        .all()
+    )
+
+
+def sum_allocated_curtailed_for_report(
+    db: Session, report: models.DailyReport
+) -> float:
+    """汇总某日报关联的所有限发分摊电量（权威口径）。"""
+    allocs = get_curtailment_allocations_for_report(db, report)
+    return round(sum(a.allocated_curtailed_kwh for a in allocs), 2)
+
+
+def validate_curtailment_allocations(
+    db: Session,
+    record_date: date,
+    allocations: List[schemas.CurtailmentAllocationCreate],
+    total_curtailed_kwh: float,
+) -> List[str]:
+    """
+    校验限发分摊：
+      1. 分摊电量之和 = 总限电量
+      2. 每台机组当天必须有日报
+      3. 分摊电量 ≤ 该机组当天「剩余可用容量」（= 容量 × 可用小时 − 实际发电），
+         保证不把故障停机时段的电量也算作限电损失
+      4. 同一机组同一天不重复分摊（检查是否已存在其他分摊记录）
+    """
+    errors: List[str] = []
+
+    alloc_sum = round(sum(a.allocated_curtailed_kwh for a in allocations), 2)
+    if abs(alloc_sum - total_curtailed_kwh) > 0.01:
+        errors.append(
+            f"分摊电量之和 {alloc_sum} kWh 与总限电量 {total_curtailed_kwh} kWh 不一致"
+        )
+
+    seen_units: set[int] = set()
+    for a in allocations:
+        if a.unit_id in seen_units:
+            errors.append(f"机组 {a.unit_id} 在本次分摊中重复出现")
+            continue
+        seen_units.add(a.unit_id)
+
+        report = None
+        if a.daily_report_id:
+            report = crud.get_report(db, a.daily_report_id)
+            if report and report.unit_id != a.unit_id:
+                errors.append(
+                    f"机组 {a.unit_id} 的分摊关联了错误的日报 {a.daily_report_id}"
+                )
+                report = None
+        if report is None:
+            report = (
+                db.query(models.DailyReport)
+                .filter(
+                    models.DailyReport.unit_id == a.unit_id,
+                    models.DailyReport.report_date == record_date,
+                )
+                .first()
+            )
+            if report is None:
+                errors.append(f"机组 {a.unit_id} 在 {record_date} 没有日报，无法分摊")
+                continue
+
+        if report.report_date != record_date:
+            errors.append(
+                f"机组 {a.unit_id} 的日报日期 {report.report_date} 与限发日期 {record_date} 不一致"
+            )
+
+        unit = crud.get_unit(db, a.unit_id)
+        if unit is None:
+            errors.append(f"机组 {a.unit_id} 不存在")
+            continue
+
+        cap_errors = validate_daily_report_capacity(report, unit.rated_capacity_kw)
+        if cap_errors:
+            errors.extend(cap_errors)
+
+        available, _ = normalize_daily_report_fields(report, unit.rated_capacity_kw)
+        theoretical_max = round(unit.rated_capacity_kw * available, 2)
+        remaining_capacity = max(0.0, theoretical_max - report.generation_kwh)
+
+        existing_alloc = sum_allocated_curtailed_for_report(db, report)
+        total_allocatable = max(0.0, remaining_capacity - existing_alloc)
+        if a.allocated_curtailed_kwh > total_allocatable + 0.01:
+            errors.append(
+                f"机组 {unit.code} 在 {record_date} 最多可分摊限电 "
+                f"{total_allocatable} kWh（剩余容量 {remaining_capacity} kWh"
+                f" − 已分摊 {existing_alloc} kWh），本次分摊 {a.allocated_curtailed_kwh} kWh 超出"
+            )
+
+    return errors
+
+
+def allocate_curtailed_by_available_hours(
+    db: Session,
+    record_date: date,
+    total_curtailed_kwh: float,
+    unit_ids: List[int],
+) -> List[schemas.CurtailmentAllocationCreate]:
+    """
+    按各机组当天「可用小时 × 额定容量」的权重来分摊总限电量。
+    故障停机时段不计入分摊权重，避免把故障损失也算作限电损失。
+    """
+    weight_sum = 0.0
+    unit_weights: Dict[int, Tuple[float, Optional[int]]] = {}
+
+    for uid in unit_ids:
+        unit = crud.get_unit(db, uid)
+        if unit is None:
+            continue
+        report = (
+            db.query(models.DailyReport)
+            .filter(
+                models.DailyReport.unit_id == uid,
+                models.DailyReport.report_date == record_date,
+            )
+            .first()
+        )
+        if report is None:
+            continue
+        available, _ = normalize_daily_report_fields(report, unit.rated_capacity_kw)
+        weight = max(0.0, unit.rated_capacity_kw * available)
+        weight_sum += weight
+        unit_weights[uid] = (weight, report.id)
+
+    if weight_sum <= 0:
+        return []
+
+    result: List[schemas.CurtailmentAllocationCreate] = []
+    remaining_kwh = total_curtailed_kwh
+    uids = sorted(unit_weights.keys())
+    for i, uid in enumerate(uids):
+        weight, report_id = unit_weights[uid]
+        if i == len(uids) - 1:
+            alloc_kwh = round(remaining_kwh, 2)
+        else:
+            alloc_kwh = round(total_curtailed_kwh * weight / weight_sum, 2)
+            remaining_kwh = round(remaining_kwh - alloc_kwh, 2)
+        if alloc_kwh > 0:
+            result.append(
+                schemas.CurtailmentAllocationCreate(
+                    unit_id=uid,
+                    daily_report_id=report_id,
+                    allocated_curtailed_kwh=alloc_kwh,
+                )
+            )
+    return result
 
 
 class _UnitAccum:
@@ -18,7 +245,9 @@ class _UnitAccum:
         self.generation_kwh = 0.0
         self.grid_connected_kwh = 0.0
         self.curtailed_kwh = 0.0
+        self.allocated_curtailed_kwh = 0.0
         self.fault_downtime_hours = 0.0
+        self.available_hours = 0.0
         self.settlement_kwh = 0.0
         self.trial_operation_kwh = 0.0
         self.pending_review_kwh = 0.0
@@ -26,14 +255,29 @@ class _UnitAccum:
         self.review_difference_kwh = 0.0
         self.review_difference_notes: List[str] = []
 
-    def add(self, report: models.DailyReport) -> None:
+    def add(self, report: models.DailyReport, db: Optional[Session] = None) -> None:
+        available, normalized_grid = normalize_daily_report_fields(
+            report, self.unit.rated_capacity_kw
+        )
+
         self.generation_kwh += report.generation_kwh
-        self.grid_connected_kwh += report.grid_connected_kwh
-        self.curtailed_kwh += report.curtailed_kwh
+        self.grid_connected_kwh += normalized_grid
         self.fault_downtime_hours += report.fault_downtime_hours
+        self.available_hours += available
+
+        allocated = 0.0
+        if db is not None:
+            allocated = sum_allocated_curtailed_for_report(db, report)
+        elif hasattr(report, "curtailment_allocations"):
+            allocated = round(
+                sum(a.allocated_curtailed_kwh for a in report.curtailment_allocations), 2
+            )
+        self.allocated_curtailed_kwh += allocated
+        self.curtailed_kwh += max(report.curtailed_kwh, allocated)
+
         review = getattr(report, "trial_review", None)
         if report.is_trial_operation:
-            self.trial_operation_kwh += report.grid_connected_kwh
+            self.trial_operation_kwh += normalized_grid
             if review is not None and review.status == models.TrialOperationReview.STATUS_PASSED:
                 self.settlement_kwh += review.settled_kwh
                 self.reviewed_settled_kwh += review.settled_kwh
@@ -42,12 +286,12 @@ class _UnitAccum:
                     if review.difference_reason:
                         self.review_difference_notes.append(review.difference_reason)
             else:
-                self.pending_review_kwh += report.grid_connected_kwh
+                self.pending_review_kwh += normalized_grid
                 if review is not None and review.difference_reason:
                     self.review_difference_notes.append(review.difference_reason)
                     self.review_difference_kwh += review.difference_kwh
         elif _unit_settled(self.unit):
-            self.settlement_kwh += report.grid_connected_kwh
+            self.settlement_kwh += normalized_grid
 
 
 def _unit_settled(unit: models.Unit) -> bool:
@@ -67,6 +311,7 @@ def _load_reports(
     q = db.query(models.DailyReport).options(
         joinedload(models.DailyReport.unit).selectinload(models.Unit.acceptance),
         selectinload(models.DailyReport.trial_review),
+        selectinload(models.DailyReport.curtailment_allocations),
     )
     if start_date:
         q = q.filter(models.DailyReport.report_date >= start_date)
@@ -89,9 +334,32 @@ def _group_key(dimension: str, report: models.DailyReport) -> str:
     raise ValueError(f"不支持的统计维度: {dimension}")
 
 
-def _build_unit_item(acc: _UnitAccum) -> schemas.UnitStatsItem:
+def _calc_total_hours(
+    reports: List[models.DailyReport],
+    dimension: str,
+    group_key: Optional[str] = None,
+) -> float:
+    """根据统计维度计算该组数据覆盖的总小时数（用于可用率计算）。"""
+    if dimension == "daily":
+        return HOURS_PER_DAY
+    if dimension == "batch" and group_key is None:
+        dates = {r.report_date for r in reports}
+        return len(dates) * HOURS_PER_DAY
+    if dimension == "monthly":
+        dates = [r.report_date for r in reports]
+        if dates:
+            d0 = min(dates)
+            from calendar import monthrange
+            _, days = monthrange(d0.year, d0.month)
+            return days * HOURS_PER_DAY
+    dates = {r.report_date for r in reports}
+    return max(1.0, len(dates) * HOURS_PER_DAY)
+
+
+def _build_unit_item(acc: _UnitAccum, total_hours: float) -> schemas.UnitStatsItem:
     cap = acc.unit.rated_capacity_kw or 0.0
     equiv = acc.grid_connected_kwh / cap if cap else 0.0
+    avail_rate = acc.available_hours / total_hours if total_hours > 0 else 0.0
     return schemas.UnitStatsItem(
         unit_id=acc.unit.id,
         unit_code=acc.unit.code,
@@ -100,7 +368,9 @@ def _build_unit_item(acc: _UnitAccum) -> schemas.UnitStatsItem:
         generation_kwh=round(acc.generation_kwh, 2),
         grid_connected_kwh=round(acc.grid_connected_kwh, 2),
         curtailed_kwh=round(acc.curtailed_kwh, 2),
+        allocated_curtailed_kwh=round(acc.allocated_curtailed_kwh, 2),
         fault_downtime_hours=round(acc.fault_downtime_hours, 2),
+        available_hours=round(acc.available_hours, 2),
         settlement_kwh=round(acc.settlement_kwh, 2),
         trial_operation_kwh=round(acc.trial_operation_kwh, 2),
         pending_review_kwh=round(acc.pending_review_kwh, 2),
@@ -108,15 +378,22 @@ def _build_unit_item(acc: _UnitAccum) -> schemas.UnitStatsItem:
         review_difference_kwh=round(acc.review_difference_kwh, 2),
         review_difference_notes=list(acc.review_difference_notes),
         equivalent_utilization_hours=round(equiv, 2),
+        availability_rate=round(avail_rate, 4),
     )
 
 
-def _build_group_item(group_key: str, accs: Dict[int, _UnitAccum]) -> schemas.StatsGroupItem:
-    units = [_build_unit_item(a) for a in accs.values()]
+def _build_group_item(
+    group_key: str,
+    accs: Dict[int, _UnitAccum],
+    total_hours: float,
+) -> schemas.StatsGroupItem:
+    units = [_build_unit_item(a, total_hours) for a in accs.values()]
     units.sort(key=lambda u: u.unit_code)
     total_cap = sum(u.rated_capacity_kw for u in units)
     total_grid = sum(u.grid_connected_kwh for u in units)
+    total_avail_hours = sum(u.available_hours for u in units)
     equiv = total_grid / total_cap if total_cap else 0.0
+    avail_rate = total_avail_hours / (total_hours * len(units)) if (total_hours * len(units)) > 0 else 0.0
     notes: List[str] = []
     for u in units:
         notes.extend(u.review_difference_notes)
@@ -127,24 +404,41 @@ def _build_group_item(group_key: str, accs: Dict[int, _UnitAccum]) -> schemas.St
         generation_kwh=round(sum(u.generation_kwh for u in units), 2),
         grid_connected_kwh=round(total_grid, 2),
         curtailed_kwh=round(sum(u.curtailed_kwh for u in units), 2),
+        allocated_curtailed_kwh=round(sum(u.allocated_curtailed_kwh for u in units), 2),
         fault_downtime_hours=round(sum(u.fault_downtime_hours for u in units), 2),
+        available_hours=round(total_avail_hours, 2),
         settlement_kwh=round(sum(u.settlement_kwh for u in units), 2),
         trial_operation_kwh=round(sum(u.trial_operation_kwh for u in units), 2),
         pending_review_kwh=round(sum(u.pending_review_kwh for u in units), 2),
         reviewed_settled_kwh=round(sum(u.reviewed_settled_kwh for u in units), 2),
         review_difference_kwh=round(sum(u.review_difference_kwh for u in units), 2),
         review_difference_notes=notes,
+        equivalent_utilization_hours=round(equiv, 2),
+        availability_rate=round(avail_rate, 4),
         units=units,
     )
 
 
 def _accumulate_all(
     reports: List[models.DailyReport],
+    db: Optional[Session] = None,
 ) -> Dict[int, _UnitAccum]:
     accs: Dict[int, _UnitAccum] = {}
     for r in reports:
-        accs.setdefault(r.unit_id, _UnitAccum(r.unit)).add(r)
+        accs.setdefault(r.unit_id, _UnitAccum(r.unit)).add(r, db)
     return accs
+
+
+def _accumulate_grouped(
+    reports: List[models.DailyReport],
+    dimension: str,
+    db: Optional[Session] = None,
+) -> Dict[str, Dict[int, _UnitAccum]]:
+    grouped: Dict[str, Dict[int, _UnitAccum]] = {}
+    for r in reports:
+        gk = _group_key(dimension, r)
+        grouped.setdefault(gk, {}).setdefault(r.unit_id, _UnitAccum(r.unit)).add(r, db)
+    return grouped
 
 
 def build_statistics(
@@ -159,16 +453,17 @@ def build_statistics(
         raise ValueError(f"dimension 仅支持 {DIMENSIONS}")
 
     reports = _load_reports(db, start_date, end_date, batch, unit_id)
+    grouped = _accumulate_grouped(reports, dimension, db)
 
-    grouped: Dict[str, Dict[int, _UnitAccum]] = {}
-    for r in reports:
-        gk = _group_key(dimension, r)
-        grouped.setdefault(gk, {}).setdefault(r.unit_id, _UnitAccum(r.unit)).add(r)
-
-    group_items = [_build_group_item(gk, accs) for gk, accs in grouped.items()]
+    group_items: List[schemas.StatsGroupItem] = []
+    for gk, accs in grouped.items():
+        group_reports = [r for r in reports if _group_key(dimension, r) == gk]
+        total_hours = _calc_total_hours(group_reports, dimension, gk)
+        group_items.append(_build_group_item(gk, accs, total_hours))
     group_items.sort(key=lambda g: g.group_key)
 
-    totals = _build_group_item("总计(全周期)", _accumulate_all(reports))
+    total_hours_all = _calc_total_hours(reports, dimension, None)
+    totals = _build_group_item("总计(全周期)", _accumulate_all(reports, db), total_hours_all)
 
     return schemas.StatisticsResponse(
         dimension=dimension,
@@ -187,7 +482,7 @@ def build_settlement_report(
     batch: Optional[str] = None,
 ) -> schemas.SettlementReport:
     reports = _load_reports(db, start_date, end_date, batch, None)
-    accs = _accumulate_all(reports)
+    accs = _accumulate_all(reports, db)
 
     rows: List[schemas.SettlementRow] = []
     for acc in accs.values():

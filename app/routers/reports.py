@@ -4,7 +4,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app import crud, schemas
+from app import crud, schemas, services
 from app.database import get_db
 
 router = APIRouter(prefix="/reports", tags=["日报"])
@@ -26,8 +26,12 @@ def list_reports(
     "", response_model=schemas.DailyReportOut, status_code=status.HTTP_201_CREATED
 )
 def create_report(payload: schemas.DailyReportCreate, db: Session = Depends(get_db)):
-    if not crud.get_unit(db, payload.unit_id):
+    unit = crud.get_unit(db, payload.unit_id)
+    if not unit:
         raise HTTPException(status_code=404, detail="机组不存在")
+    errors = services.validate_daily_report_capacity(payload, unit.rated_capacity_kw)
+    if errors:
+        raise HTTPException(status_code=400, detail="；".join(errors))
     return crud.create_report(db, payload)
 
 
@@ -48,6 +52,13 @@ def update_report(
     obj = crud.get_report(db, report_id)
     if not obj:
         raise HTTPException(status_code=404, detail="日报不存在")
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, k, v)
+    unit = crud.get_unit(db, obj.unit_id)
+    if unit:
+        errors = services.validate_daily_report_capacity(obj, unit.rated_capacity_kw)
+        if errors:
+            raise HTTPException(status_code=400, detail="；".join(errors))
     return crud.update_report(db, obj, payload)
 
 

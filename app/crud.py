@@ -5,7 +5,7 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from app import models, schemas
+from app import models, schemas, services
 
 
 # ---------------- Units ----------------
@@ -102,7 +102,13 @@ def get_report(db: Session, report_id: int) -> Optional[models.DailyReport]:
 
 
 def create_report(db: Session, payload: schemas.DailyReportCreate) -> models.DailyReport:
-    obj = models.DailyReport(**payload.model_dump())
+    unit = get_unit(db, payload.unit_id)
+    cap = unit.rated_capacity_kw if unit else 0.0
+    available, grid = services.normalize_daily_report_fields(payload, cap)
+    data = payload.model_dump()
+    data["available_hours"] = available
+    data["grid_connected_kwh"] = grid
+    obj = models.DailyReport(**data)
     db.add(obj)
     db.commit()
     db.refresh(obj)
@@ -116,6 +122,11 @@ def update_report(
 ) -> models.DailyReport:
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
+    unit = get_unit(db, obj.unit_id)
+    cap = unit.rated_capacity_kw if unit else 0.0
+    available, grid = services.normalize_daily_report_fields(obj, cap)
+    obj.available_hours = available
+    obj.grid_connected_kwh = grid
     db.commit()
     db.refresh(obj)
     return obj
